@@ -16,4 +16,6 @@ depends: [
   "ocamlfind" {build}
   "owee"
   "base-raw_spacetime_lib"
+  "base-bigarray"
+  "base-unix"
 ]
