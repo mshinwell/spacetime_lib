@@ -1,0 +1,17 @@
+opam-version: "1.2"
+name: "spacetime_lib"
+version: "0.1"
+maintainer: "Leo White <lwhite@janestreet.com>"
+authors: ["Leo White <lwhite@janestreet.com>" "Mark Shinwell <mshinwell@janestreet.com>"]
+homepage: "https://github.com/janestreet/spacetime_lib"
+bug-reports: "https://github.com/janestreet/spacetime_lib"
+license: "MIT"
+dev-repo: "https://github.com/janestreet/spacetime_lib"
+build: [
+  [make]
+]
+install: [make "install"]
+remove: ["ocamlfind" "remove" "spacetime_lib"]
+depends: [
+  "ocamlfind" {build}
+]
