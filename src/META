@@ -2,5 +2,4 @@ name="owee"
 version="0.1"
 description="Library for decoding Spacetime profiles"
 archive(native)="spacetime_lib.cmxa"
-# CR mshinwell: uncomment once there is a META file for this
-requires="bigarray unix"
+requires="raw_spacetime_lib bigarray unix"
