@@ -32,8 +32,12 @@ module Position = struct
 
   let print ppf t =
     let open Printexc in
-    Format.fprintf ppf "%s{%d:%d-%d}"
-      t.filename t.line_number t.start_char t.end_char
+    if t.start_char < 0 then
+      Format.fprintf ppf "%s{%d}"
+        t.filename t.line_number
+    else
+      Format.fprintf ppf "%s{%d:%d-%d}"
+        t.filename t.line_number t.start_char t.end_char
 
 end
 
@@ -70,10 +74,29 @@ module Location = struct
     { address; symbol; position; foreign; }
 
   let create_foreign ?executable pc =
-    { address = Program_counter.Foreign.to_int64 pc;
+    let program_counter = Program_counter.Foreign.to_int64 pc in
+    let position =
+      match executable with
+      | None -> None
+      | Some elf_locations ->
+        match Elf_locations.resolve elf_locations ~program_counter with
+        | None -> None
+        | Some (filename, line_number) ->
+          let location =
+            { Printexc.
+              filename;
+              line_number;
+              start_char = -1;
+              end_char = -1;
+            }
+          in
+          Some location
+    in
+    { address = program_counter;
       symbol = None;
-      position = None;
-      foreign = true; }
+      position;
+      foreign = true;
+    }
 
   let print ppf t =
     match t.position with
@@ -390,6 +413,12 @@ module Series = struct
   type t = Snapshot.t list
 
   let create ?executable path =
+    let executable =
+      match executable with
+      | None -> None
+      | Some executable ->
+        Some (Elf_locations.create ~elf_executable:executable)
+    in
     let series = Heap_snapshot.Series.read ~path in
     let frame_table = Heap_snapshot.Series.frame_table series in
     let shape_table = Heap_snapshot.Series.shape_table series in

@@ -9,9 +9,12 @@ endif
 
 RESULT=spacetime_lib
 
-SOURCES=spacetime_lib.mli spacetime_lib.ml
+SOURCES=elf_locations.mli elf_locations.ml spacetime_lib.mli spacetime_lib.ml
 
-PACKS=raw_spacetime_lib
+PACKS=owee
+# CR mshinwell: this would change to "PACKS" once findlib provides
+# the META file for raw_spacetime_lib, I think.
+LIBS=raw_spacetime_lib
 
 all: native-code-library
 
