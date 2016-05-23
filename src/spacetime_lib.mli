@@ -21,9 +21,6 @@ module Position : sig
   val start_char : t -> int
   val end_char : t -> int
 
-  val compare : t -> t -> int
-  val hash : t -> int
-
 end
 
 module Location : sig
@@ -35,17 +32,11 @@ module Location : sig
   val position : t -> Position.t option
   val foreign : t -> bool
 
-  val compare : t -> t -> int
-  val hash : t -> int
-
 end
 
 module Backtrace : sig
 
   type t = Location.t list
-
-  val compare : t -> t -> int
-  val hash : t -> int
 
 end
 
@@ -56,25 +47,15 @@ module Entry : sig
   val backtrace : t -> Backtrace.t
   val blocks : t -> int
   val words : t -> int
+  val allocations : t -> int
 
-  val compare : t -> t -> int
-  val hash : t -> int
-
-end
-
-module Entry_sorted_by_words_highest_first : sig
-  type t = Entry.t
-  val compare : t -> t -> int
-  val hash : t -> int
 end
 
 module Entries : Set.S
   with type elt = Entry.t
-  and type t = Set.Make(Entry).t
 
 module Entries_sorted_by_words_highest_first : Set.S
   with type elt = Entry.t
-  and type t = Set.Make(Entry_sorted_by_words_highest_first).t
 
 module Stats : sig
 
@@ -92,9 +73,6 @@ module Stats : sig
   val words_scanned : t -> int
   val words_scanned_with_profinfo : t -> int
 
-  val compare : t -> t -> int
-  val hash : t -> int
-
 end
 
 
@@ -108,9 +86,6 @@ module Snapshot : sig
   val entries_sorted_by_words_highest_first
      : t
     -> Entries_sorted_by_words_highest_first.t
-
-  val compare : t -> t -> int
-  val hash : t -> int
 
   val raw : t -> Raw_spacetime_lib.Heap_snapshot.t
 end

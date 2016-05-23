@@ -26,18 +26,10 @@ module Position = struct
 
   let end_char { Printexc.end_char } = end_char
 
-  let compare = Pervasives.compare
-
-  let hash = Hashtbl.hash
-
   let print ppf t =
     let open Printexc in
-    if t.start_char < 0 then
-      Format.fprintf ppf "%s{%d}"
-        t.filename t.line_number
-    else
-      Format.fprintf ppf "%s{%d:%d-%d}"
-        t.filename t.line_number t.start_char t.end_char
+    Format.fprintf ppf "%s{%d:%d-%d}"
+      t.filename t.line_number t.start_char t.end_char
 
 end
 
@@ -57,9 +49,8 @@ module Location = struct
 
   let foreign { foreign } = foreign
 
-  let compare = Pervasives.compare
-
-  let hash = Hashtbl.hash
+  let compare t1 t2 =
+    Int64.compare t1.address t2.address
 
   let create_ocaml ?executable ~frame_table pc =
     let address = Program_counter.OCaml.to_int64 pc in
@@ -112,9 +103,15 @@ module Backtrace = struct
 
   type t = Location.t list
 
-  let compare = Pervasives.compare
-
-  let hash = Hashtbl.hash
+  let rec compare b1 b2 =
+    match b1, b2 with
+    | [], [] -> 0
+    | l1 :: b1, l2 :: b2 ->
+      let c = Location.compare l1 l2 in
+      if c <> 0 then c
+      else compare b1 b2
+    | _ :: _, [] -> 1
+    | [], _ :: _ -> -1
 
   let rec print ppf = function
     | [] -> ()
@@ -129,9 +126,11 @@ end
 module Entry = struct
 
   type t =
-    { backtrace : Backtrace.t;
+    { thread : int;
+      backtrace : Backtrace.t;
       blocks : int;
-      words : int; }
+      words : int;
+      allocations : int; }
 
   let backtrace { backtrace } = backtrace
 
@@ -139,7 +138,12 @@ module Entry = struct
 
   let words { words } = words
 
-  let compare = Pervasives.compare
+  let allocations { allocations } = allocations
+
+  let compare t1 t2 =
+    let c = compare t1.thread t2.thread in
+    if c <> 0 then c
+    else Backtrace.compare t1.backtrace t2.backtrace
 
   let hash = Hashtbl.hash
 
@@ -181,10 +185,6 @@ module Stats = struct
   let words_scanned_with_profinfo { words_scanned_with_profinfo } =
     words_scanned_with_profinfo
 
-  let compare = Pervasives.compare
-
-  let hash = Hashtbl.hash
-
 end
 
 module Snapshot = struct
@@ -207,6 +207,25 @@ module Snapshot = struct
         Entries_sorted_by_words_highest_first.add entry acc)
       entries
       Entries_sorted_by_words_highest_first.empty
+
+  let create ~snapshot ~entries =
+    let time = Heap_snapshot.timestamp snapshot in
+    let gc = Heap_snapshot.gc_stats snapshot in
+    let words_scanned = Heap_snapshot.words_scanned snapshot in
+    let words_scanned_with_profinfo =
+      Heap_snapshot.words_scanned_with_profinfo snapshot
+    in
+    let stats =
+      { Stats.gc; words_scanned; words_scanned_with_profinfo; }
+    in
+    { time; stats; entries; raw = snapshot; }
+
+  let raw t = t.raw
+end
+
+module Series = struct
+
+  type t = Snapshot.t list
 
   let rec fold_ocaml_indirect_calls ?executable ~frame_table ~shape_table
             visited f backtrace acc callee =
@@ -322,7 +341,42 @@ module Snapshot = struct
       fold_foreign_node ?executable ~frame_table ~shape_table visited f
         backtrace acc node
 
-  let allocation_table ~snapshot =
+  let fold_trace ?executable ~frame_table ~shape_table f acc trace =
+    match Trace.root trace with
+    | None -> acc
+    | Some node ->
+      let visited = ref Trace.Node.Set.empty in
+      fold_node ?executable ~frame_table ~shape_table visited f [] acc node
+
+  let fold_traces ?executable ~series ~frame_table ~shape_table f acc =
+    let num_threads = Heap_snapshot.Series.num_threads series in
+    let rec loop acc n =
+      if n >= num_threads then acc
+      else begin
+        let normal =
+          Heap_snapshot.Series.trace series Heap_snapshot.Series.Normal n
+        in
+        let acc =
+          match normal with
+          | None -> acc
+          | Some trace ->
+            fold_trace ?executable ~frame_table ~shape_table (f n) acc trace
+        in
+        let finaliser =
+          Heap_snapshot.Series.trace series Heap_snapshot.Series.Finaliser n
+        in
+        let acc =
+          match finaliser with
+          | None -> acc
+          | Some trace ->
+            fold_trace ?executable ~frame_table ~shape_table (f ~-n) acc trace
+        in
+        loop acc (n + 1)
+      end
+    in
+    loop acc 0
+
+  let live_table ~snapshot =
     let entries = Heap_snapshot.entries snapshot in
     let length = Heap_snapshot.Entries.length entries in
     let tbl = Hashtbl.create 42 in
@@ -337,89 +391,31 @@ module Snapshot = struct
     done;
     tbl
 
-  let fold_trace ?executable ~frame_table ~shape_table ~alloc_table acc trace =
-    match Trace.root trace with
-    | None -> acc
-    | Some node ->
-      let visited = ref Trace.Node.Set.empty in
-      fold_node ?executable ~frame_table ~shape_table visited
-        (fun backtrace alloc acc ->
-           match Hashtbl.find alloc_table alloc with
-           | (blocks, words) ->
-             let entry = { Entry.backtrace; blocks; words } in
-             Entries.add entry acc
-           | exception Not_found -> acc)
-        [] acc node
-
-  let create ?executable ~series ~frame_table ~shape_table ~snapshot =
-    let time = Heap_snapshot.timestamp snapshot in
-    let gc = Heap_snapshot.gc_stats snapshot in
-    let words_scanned = Heap_snapshot.words_scanned snapshot in
-    let words_scanned_with_profinfo =
-      Heap_snapshot.words_scanned_with_profinfo snapshot
+  let allocations_table ~snapshot =
+    let tbl = Hashtbl.create 42 in
+    let rec loop next =
+      match next with
+      | None -> ()
+      | Some allocation ->
+        let annotation = Heap_snapshot.Allocations.annotation allocation in
+        let num_words =
+          Heap_snapshot.Allocations.num_words_including_headers allocation
+        in
+        Hashtbl.add tbl annotation num_words;
+        let next = Heap_snapshot.Allocations.next allocation in
+        loop next
     in
-    let stats =
-      { Stats.gc; words_scanned; words_scanned_with_profinfo; }
-    in
-    let alloc_table = allocation_table ~snapshot in
-    let entries =
-      let num_threads = Heap_snapshot.Series.num_threads series in
-      let rec loop acc n =
-        if n >= num_threads then acc
-        else begin
-          let normal =
-            Heap_snapshot.Series.trace series Heap_snapshot.Series.Normal n
-          in
-          let acc =
-            match normal with
-            | None -> acc
-            | Some trace ->
-              fold_trace ?executable ~frame_table ~shape_table ~alloc_table
-                acc trace
-          in
-          let finaliser =
-            Heap_snapshot.Series.trace series Heap_snapshot.Series.Finaliser n
-          in
-          let acc =
-            match finaliser with
-            | None -> acc
-            | Some trace ->
-              fold_trace ?executable ~frame_table ~shape_table ~alloc_table
-                acc trace
-          in
-          loop acc (n + 1)
-        end
-      in
-      loop Entries.empty 0
-    in
-    { time; stats; entries; raw = snapshot; }
-
-  let compare x y =
-    let cmp = Pervasives.compare x.time y.time in
-    if cmp <> 0 then cmp
-    else begin
-      let cmp = Stats.compare x.stats y.stats in
-      if cmp <> 0 then cmp
-      else Entries.compare x.entries y.entries
-    end
-
-  let hash = Hashtbl.hash
-
-  let raw t = t.raw
-end
-
-module Series = struct
-
-  type t = Snapshot.t list
+    loop (Heap_snapshot.allocations snapshot);
+    tbl
 
   let create ?executable path =
+    let series = Heap_snapshot.Series.read ~path in
     let executable =
       match executable with
       | None -> None
       | Some executable ->
         Some (Elf_locations.create ~elf_executable:executable)
     in
-    let series = Heap_snapshot.Series.read ~path in
     let frame_table = Heap_snapshot.Series.frame_table series in
     let shape_table = Heap_snapshot.Series.shape_table series in
     let length = Heap_snapshot.Series.num_snapshots series in
@@ -433,10 +429,39 @@ module Series = struct
       in
       loop [] (length - 1)
     in
+    let init =
       List.map
         (fun snapshot ->
-           Snapshot.create ?executable ~series ~frame_table ~shape_table
-             ~snapshot)
+           let live_table = live_table ~snapshot in
+           let alloc_table = allocations_table ~snapshot in
+             snapshot, live_table, alloc_table, Entries.empty)
         snapshots
+    in
+    let accumulate thread backtrace annot accs =
+      List.map
+        (fun ((snapshot, live_table, alloc_table, entries) as acc) ->
+           match Hashtbl.find live_table annot with
+           | (blocks, words) -> begin
+               match Hashtbl.find alloc_table annot with
+               | allocations ->
+                 let entry =
+                   { Entry.thread; backtrace; blocks; words; allocations }
+                 in
+                 let entries = Entries.add entry entries in
+                 (snapshot, live_table, alloc_table, entries)
+               | exception Not_found -> acc
+             end
+           | exception Not_found -> acc)
+        accs
+    in
+    let snapshots =
+      fold_traces ?executable ~series ~frame_table ~shape_table accumulate init
+    in
+    let snapshots =
+      List.map
+        (fun (snapshot, _, _, entries) -> Snapshot.create ~snapshot ~entries)
+        snapshots
+    in
+    snapshots
 
 end
