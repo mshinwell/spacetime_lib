@@ -54,8 +54,13 @@ module Location = struct
 
   let create_ocaml ?executable ~frame_table pc =
     let address = Program_counter.OCaml.to_int64 pc in
-    let symbol = None in
     let foreign = false in
+    let symbol =
+      match executable with
+      | None -> None
+      | Some elf_locations ->
+        Elf_locations.function_at_pc elf_locations ~program_counter:address
+    in
     let position =
       try
         let slot = Frame_table.find_exn pc frame_table in
