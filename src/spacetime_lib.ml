@@ -83,8 +83,14 @@ module Location = struct
           in
           Some location
     in
+    let symbol =
+      match executable with
+      | None -> None
+      | Some elf_locations ->
+        Elf_locations.function_at_pc elf_locations ~program_counter
+    in
     { address = program_counter;
-      symbol = None;
+      symbol;
       position;
       foreign = true;
     }

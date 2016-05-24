@@ -3,6 +3,8 @@
 type t = {
   map : Owee_buf.t;
   sections : Owee_elf.section array;
+  strtab : Owee_elf.String_table.t option;
+  symtab : Owee_elf.Symbol_table.t option;
   resolved : (Int64.t, (string * int) option) Hashtbl.t;
 }
 
@@ -16,7 +18,9 @@ let create ~elf_executable =
   Unix.close fd;
   let _header, sections = Owee_elf.read_elf map in
   let resolved = Hashtbl.create 42 in
-  { map; sections; resolved; }
+  let strtab = Owee_elf.find_string_table map sections in
+  let symtab = Owee_elf.find_symbol_table map sections in
+  { map; sections; strtab; symtab; resolved; }
 
 (* CR mshinwell: tidy all this up.  Also, the pinpointing of which row
    is the correct one isn't great. *)
@@ -92,3 +96,15 @@ let resolve t ~program_counter =
   match Hashtbl.find t.resolved program_counter with
   | resolved -> resolved
   | exception Not_found -> resolve_from_dwarf t ~program_counter
+
+let function_at_pc t ~program_counter:address =
+  match t.symtab, t.strtab with
+  | None, None | Some _, None | None, Some _ -> None
+  | Some symtab, Some strtab ->
+    match
+      Owee_elf.Symbol_table.functions_enclosing_address symtab ~address
+    with
+    | [] -> None
+    (* Just take the first one for the moment.  There will usually be
+       only one. *)
+    | sym::_ -> Owee_elf.Symbol_table.Symbol.name sym strtab
