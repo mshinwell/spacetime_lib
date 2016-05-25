@@ -451,18 +451,24 @@ module Series = struct
     let accumulate thread backtrace annot accs =
       List.map
         (fun ((snapshot, live_table, alloc_table, entries) as acc) ->
-           match Hashtbl.find live_table annot with
-           | (blocks, words) -> begin
-               match Hashtbl.find alloc_table annot with
-               | allocations ->
-                 let entry =
-                   { Entry.thread; backtrace; blocks; words; allocations }
-                 in
-                 let entries = Entries.add entry entries in
-                 (snapshot, live_table, alloc_table, entries)
-               | exception Not_found -> acc
-             end
-           | exception Not_found -> acc)
+           let blocks, words =
+             match Hashtbl.find live_table annot with
+             | blocks, words -> blocks, words
+             | exception Not_found -> 0, 0
+           in
+           let allocations =
+             match Hashtbl.find alloc_table annot with
+             | allocations -> allocations
+             | exception Not_found -> 0
+           in
+           if blocks <> 0 || words <> 0 || allocations <> 0 then
+             let entry =
+               { Entry.thread; backtrace; blocks; words; allocations }
+             in
+             let entries = Entries.add entry entries in
+             snapshot, live_table, alloc_table, entries
+           else
+             acc)
         accs
     in
     let snapshots =
