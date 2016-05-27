@@ -51,12 +51,6 @@ module Entry : sig
 
 end
 
-module Entries : Set.S
-  with type elt = Entry.t
-
-module Entries_sorted_by_words_highest_first : Set.S
-  with type elt = Entry.t
-
 module Stats : sig
 
   type t
@@ -82,10 +76,7 @@ module Snapshot : sig
 
   val time : t -> float
   val stats : t -> Stats.t
-  val entries : t -> Entries.t
-  val entries_sorted_by_words_highest_first
-     : t
-    -> Entries_sorted_by_words_highest_first.t
+  val entries : t -> Entry.t list
 
   val raw : t -> Raw_spacetime_lib.Heap_snapshot.t
 end

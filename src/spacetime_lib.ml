@@ -134,45 +134,102 @@ module Backtrace = struct
 
 end
 
+module Small_count : sig
+
+  type t
+
+  val max_allocations : int
+
+  val max_words : int
+
+  val max_blocks : int
+
+  val create : allocations:int -> words:int -> blocks:int -> t
+
+  val allocations : t -> int
+
+  val words : t -> int
+
+  val blocks : t -> int
+
+end = struct
+
+  type t = int
+
+  let allocations_size = Sys.int_size / 2
+  let words_size = (Sys.int_size - allocations_size) / 2
+  let blocks_size = Sys.int_size - allocations_size - words_size
+
+  let max_allocations = ((1 lsl allocations_size) - 1)
+  let max_words = ((1 lsl words_size) - 1)
+  let max_blocks = ((1 lsl blocks_size) - 1)
+
+  let blocks_shift = 0
+  let words_shift = blocks_shift + blocks_size
+  let allocations_shift = words_shift + words_size
+
+  let allocations_mask = max_allocations lsl allocations_shift
+  let words_mask = max_words lsl words_shift
+  let blocks_mask = max_blocks lsl blocks_shift
+
+  let create ~allocations ~words ~blocks =
+    allocations lsl allocations_shift
+    lor words lsl words_shift
+    lor blocks lsl blocks_shift
+
+  let allocations t =
+    (t land allocations_mask) lsr allocations_shift
+
+  let words t =
+    (t land words_mask) lsr words_shift
+
+  let blocks t =
+    (t land blocks_mask) lsr blocks_shift
+
+end
+
 module Entry = struct
 
   type t =
-    { thread : int;
-      backtrace : Backtrace.t;
-      blocks : int;
-      words : int;
-      allocations : int; }
+    | Entry of { backtrace : Backtrace.t;
+                 blocks : int;
+                 words : int;
+                 allocations : int; }
+    | Alloc of { backtrace : Backtrace.t;
+                 allocations : int; }
+    | Small of { backtrace : Backtrace.t;
+                 counts : Small_count.t; }
 
-  let backtrace { backtrace } = backtrace
+  let create ~backtrace ~blocks ~words ~allocations =
+    if blocks = 0 && words = 0 then Alloc { backtrace; allocations }
+    else if allocations <= Small_count.max_allocations
+         && words <= Small_count.max_words
+         && blocks <= Small_count.max_blocks then
+      let counts = Small_count.create ~allocations ~words ~blocks in
+      Small { backtrace; counts }
+    else Entry { backtrace; blocks; words; allocations }
 
-  let blocks { blocks } = blocks
+  let backtrace = function
+    | Entry { backtrace } -> backtrace
+    | Alloc { backtrace } -> backtrace
+    | Small { backtrace } -> backtrace
 
-  let words { words } = words
+  let blocks = function
+    | Entry { blocks } -> blocks
+    | Alloc _ -> 0
+    | Small { counts } -> Small_count.blocks counts
 
-  let allocations { allocations } = allocations
+  let words = function
+    | Entry { words } -> words
+    | Alloc _ -> 0
+    | Small { counts } -> Small_count.words counts
 
-  let compare t1 t2 =
-    let c = compare t1.thread t2.thread in
-    if c <> 0 then c
-    else Backtrace.compare t1.backtrace t2.backtrace
-
-  let hash = Hashtbl.hash
+  let allocations = function
+    | Entry { allocations } -> allocations
+    | Alloc { allocations } -> allocations
+    | Small { counts } -> Small_count.allocations counts
 
 end
-
-module Entry_sorted_by_words_highest_first = struct
-  type t = Entry.t
-
-  let compare entry1 entry2 =
-    Pervasives.compare entry2.Entry.words entry1.Entry.words
-
-  let hash = Entry.hash
-end
-
-module Entries = Set.Make (Entry)
-
-module Entries_sorted_by_words_highest_first =
-  Set.Make (Entry_sorted_by_words_highest_first)
 
 module Stats = struct
 
@@ -203,7 +260,7 @@ module Snapshot = struct
   type t =
     { time : float;
       stats : Stats.t;
-      entries : Entries.t;
+      entries : Entry.t list;
       raw : Heap_snapshot.t;
     }
 
@@ -212,12 +269,6 @@ module Snapshot = struct
   let stats { stats } = stats
 
   let entries { entries } = entries
-
-  let entries_sorted_by_words_highest_first { entries; _ } =
-    Entries.fold (fun entry acc ->
-        Entries_sorted_by_words_highest_first.add entry acc)
-      entries
-      Entries_sorted_by_words_highest_first.empty
 
   let create ~snapshot ~entries =
     let time = Heap_snapshot.timestamp snapshot in
@@ -371,7 +422,7 @@ module Series = struct
           match normal with
           | None -> acc
           | Some trace ->
-            fold_trace ?executable ~frame_table ~shape_table (f n) acc trace
+            fold_trace ?executable ~frame_table ~shape_table f acc trace
         in
         let finaliser =
           Heap_snapshot.Series.trace series Heap_snapshot.Series.Finaliser n
@@ -380,7 +431,7 @@ module Series = struct
           match finaliser with
           | None -> acc
           | Some trace ->
-            fold_trace ?executable ~frame_table ~shape_table (f ~-n) acc trace
+            fold_trace ?executable ~frame_table ~shape_table f acc trace
         in
         loop acc (n + 1)
       end
@@ -445,10 +496,10 @@ module Series = struct
         (fun snapshot ->
            let live_table = live_table ~snapshot in
            let alloc_table = allocations_table ~snapshot in
-             snapshot, live_table, alloc_table, Entries.empty)
+             snapshot, live_table, alloc_table, [])
         snapshots
     in
-    let accumulate thread backtrace annot accs =
+    let accumulate backtrace annot accs =
       List.map
         (fun ((snapshot, live_table, alloc_table, entries) as acc) ->
            let blocks, words =
@@ -463,9 +514,9 @@ module Series = struct
            in
            if blocks <> 0 || words <> 0 || allocations <> 0 then
              let entry =
-               { Entry.thread; backtrace; blocks; words; allocations }
+               Entry.create ~backtrace ~blocks ~words ~allocations
              in
-             let entries = Entries.add entry entries in
+             let entries = entry :: entries in
              snapshot, live_table, alloc_table, entries
            else
              acc)
