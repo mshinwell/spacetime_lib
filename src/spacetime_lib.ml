@@ -188,46 +188,86 @@ end = struct
 
 end
 
+module Annotation_data = struct
+
+  type t =
+    | Nothing
+    | Alloc of { allocations : int; }
+    | Small of { counts : Small_count.t; }
+    | Large of { blocks : int;
+                 words : int;
+                 allocations : int; }
+
+  let create ~blocks ~words =
+    if words <= 0 && blocks <= 0 then Nothing
+    else if words <= Small_count.max_words
+         && blocks <= Small_count.max_blocks then
+      Small { counts = Small_count.create ~allocations:0 ~words ~blocks }
+    else Large { blocks; words; allocations = 0 }
+
+  let set_allocations t ~allocations =
+    if allocations > 0 then t
+    else begin
+      match t with
+      | Nothing -> Alloc { allocations }
+      | Alloc _ -> assert false
+      | Small { counts } ->
+        let words = Small_count.words counts in
+        let blocks = Small_count.blocks counts in
+        if allocations <= Small_count.max_allocations then begin
+          let counts = Small_count.create ~allocations ~words ~blocks in
+          Small { counts }
+        end else begin
+          Large { words; blocks; allocations }
+        end
+      | Large { words; blocks; allocations = _ } ->
+        Large { words; blocks; allocations }
+    end
+
+end
+
+
 module Entry = struct
 
   type t =
-    | Entry of { backtrace : Backtrace.t;
-                 blocks : int;
-                 words : int;
-                 allocations : int; }
     | Alloc of { backtrace : Backtrace.t;
                  allocations : int; }
     | Small of { backtrace : Backtrace.t;
                  counts : Small_count.t; }
+    | Large of { backtrace : Backtrace.t;
+                 blocks : int;
+                 words : int;
+                 allocations : int; }
 
-  let create ~backtrace ~blocks ~words ~allocations =
-    if blocks = 0 && words = 0 then Alloc { backtrace; allocations }
-    else if allocations <= Small_count.max_allocations
-         && words <= Small_count.max_words
-         && blocks <= Small_count.max_blocks then
-      let counts = Small_count.create ~allocations ~words ~blocks in
+  let create ~backtrace ~data =
+    match data with
+    | Annotation_data.Nothing -> assert false
+    | Annotation_data.Alloc { allocations } ->
+      Alloc { backtrace; allocations }
+    | Annotation_data.Small { counts } ->
       Small { backtrace; counts }
-    else Entry { backtrace; blocks; words; allocations }
+    | Annotation_data.Large { blocks; words; allocations } ->
+      Large { backtrace; blocks; words; allocations }
 
   let backtrace = function
-    | Entry { backtrace } -> backtrace
     | Alloc { backtrace } -> backtrace
     | Small { backtrace } -> backtrace
+    | Large { backtrace } -> backtrace
 
   let blocks = function
-    | Entry { blocks } -> blocks
     | Alloc _ -> 0
     | Small { counts } -> Small_count.blocks counts
+    | Large { blocks } -> blocks
 
   let words = function
-    | Entry { words } -> words
     | Alloc _ -> 0
     | Small { counts } -> Small_count.words counts
+    | Large { words } -> words
 
   let allocations = function
-    | Entry { allocations } -> allocations
     | Alloc { allocations } -> allocations
     | Small { counts } -> Small_count.allocations counts
+    | Large { allocations } -> allocations
 
 end
 
@@ -438,36 +478,71 @@ module Series = struct
     in
     loop acc 0
 
-  let live_table ~snapshot =
-    let entries = Heap_snapshot.entries snapshot in
-    let length = Heap_snapshot.Entries.length entries in
+  let data_table ~snapshots =
+    let num_snapshots = List.length snapshots in
     let tbl = Hashtbl.create 42 in
-    for entry = 0 to length - 1 do
-      let annotation = Heap_snapshot.Entries.annotation entries entry in
-      let num_blocks = Heap_snapshot.Entries.num_blocks entries entry in
-      let num_words =
-        Heap_snapshot.Entries.num_words_including_headers entries entry
-      in
-      assert (not (Hashtbl.mem tbl annotation));
-      Hashtbl.add tbl annotation (num_blocks, num_words)
-    done;
-    tbl
-
-  let allocations_table ~snapshot =
-    let tbl = Hashtbl.create 42 in
-    let rec loop next =
-      match next with
-      | None -> ()
-      | Some allocation ->
-        let annotation = Heap_snapshot.Allocations.annotation allocation in
-        let num_words =
-          Heap_snapshot.Allocations.num_words_including_headers allocation
-        in
-        Hashtbl.add tbl annotation num_words;
-        let next = Heap_snapshot.Allocations.next allocation in
-        loop next
-    in
-    loop (Heap_snapshot.allocations snapshot);
+    List.iteri
+      (fun idx snapshot ->
+         let entries = Heap_snapshot.entries snapshot in
+         let length = Heap_snapshot.Entries.length entries in
+         for entry = 0 to length - 1 do
+           let blocks = Heap_snapshot.Entries.num_blocks entries entry in
+           let words =
+             Heap_snapshot.Entries.num_words_including_headers entries entry
+           in
+           if blocks > 0 && words > 0 then begin
+             let annotation =
+               Heap_snapshot.Entries.annotation entries entry
+             in
+             let array =
+               match Hashtbl.find tbl annotation with
+               | array -> array
+               | exception Not_found ->
+                 let array =
+                   Array.make num_snapshots Annotation_data.Nothing
+                 in
+                 Hashtbl.add tbl annotation array;
+                 array
+             in
+             let data = Annotation_data.create ~words ~blocks in
+             array.(idx) <- data
+           end
+         done)
+      snapshots;
+    List.iteri
+      (fun idx snapshot ->
+         let rec loop next =
+           match next with
+           | None -> ()
+           | Some allocation ->
+             let allocations =
+               Heap_snapshot.Allocations.num_words_including_headers
+                 allocation
+             in
+             if allocations > 0 then begin
+               let annotation =
+                 Heap_snapshot.Allocations.annotation allocation
+               in
+               let array =
+                 match Hashtbl.find tbl annotation with
+                 | array -> array
+                 | exception Not_found ->
+                   let array =
+                     Array.make num_snapshots Annotation_data.Nothing
+                   in
+                   Hashtbl.add tbl annotation array;
+                   array
+               in
+               let data =
+                 Annotation_data.set_allocations array.(idx) ~allocations
+               in
+               array.(idx) <- data
+             end;
+             let next = Heap_snapshot.Allocations.next allocation in
+             loop next
+         in
+         loop (Heap_snapshot.allocations snapshot))
+      snapshots;
     tbl
 
   let create ?executable path =
@@ -491,35 +566,24 @@ module Series = struct
       in
       loop [] (length - 1)
     in
+    let data_table = data_table ~snapshots in
     let init =
-      List.map
-        (fun snapshot ->
-           let live_table = live_table ~snapshot in
-           let alloc_table = allocations_table ~snapshot in
-             snapshot, live_table, alloc_table, [])
+      List.mapi
+        (fun idx snapshot -> idx, snapshot, [])
         snapshots
     in
     let accumulate backtrace annot accs =
       List.map
-        (fun ((snapshot, live_table, alloc_table, entries) as acc) ->
-           let blocks, words =
-             match Hashtbl.find live_table annot with
-             | blocks, words -> blocks, words
-             | exception Not_found -> 0, 0
-           in
-           let allocations =
-             match Hashtbl.find alloc_table annot with
-             | allocations -> allocations
-             | exception Not_found -> 0
-           in
-           if blocks <> 0 || words <> 0 || allocations <> 0 then
-             let entry =
-               Entry.create ~backtrace ~blocks ~words ~allocations
-             in
-             let entries = entry :: entries in
-             snapshot, live_table, alloc_table, entries
-           else
-             acc)
+        (fun ((idx, snapshot, entries) as acc) ->
+           match Hashtbl.find data_table annot with
+           | exception Not_found -> acc
+           | array ->
+             match array.(idx) with
+             | Annotation_data.Nothing -> acc
+             | data ->
+               let entry = Entry.create ~backtrace ~data in
+               let entries = entry :: entries in
+               idx, snapshot, entries)
         accs
     in
     let snapshots =
@@ -527,7 +591,7 @@ module Series = struct
     in
     let snapshots =
       List.map
-        (fun (snapshot, _, _, entries) -> Snapshot.create ~snapshot ~entries)
+        (fun (_, snapshot, entries) -> Snapshot.create ~snapshot ~entries)
         snapshots
     in
     snapshots
