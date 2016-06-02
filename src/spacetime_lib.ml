@@ -206,7 +206,7 @@ module Annotation_data = struct
     else Large { blocks; words; allocations = 0 }
 
   let set_allocations t ~allocations =
-    if allocations > 0 then t
+    if allocations <= 0 then t
     else begin
       match t with
       | Nothing -> Alloc { allocations }
@@ -490,7 +490,7 @@ module Series = struct
            let words =
              Heap_snapshot.Entries.num_words_including_headers entries entry
            in
-           if blocks > 0 && words > 0 then begin
+           if blocks > 0 || words > 0 then begin
              let annotation =
                Heap_snapshot.Entries.annotation entries entry
              in
