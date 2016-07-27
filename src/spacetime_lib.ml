@@ -516,12 +516,12 @@ module Series = struct
            | None -> ()
            | Some allocation ->
              let allocations =
-               Heap_snapshot.Allocations.num_words_including_headers
+               Heap_snapshot.Total_allocation.num_words_including_headers
                  allocation
              in
              if allocations > 0 then begin
                let annotation =
-                 Heap_snapshot.Allocations.annotation allocation
+                 Heap_snapshot.Total_allocation.annotation allocation
                in
                let array =
                  match Hashtbl.find tbl annotation with
@@ -538,10 +538,10 @@ module Series = struct
                in
                array.(idx) <- data
              end;
-             let next = Heap_snapshot.Allocations.next allocation in
+             let next = Heap_snapshot.Total_allocation.next allocation in
              loop next
          in
-         loop (Heap_snapshot.allocations snapshot))
+         loop (Heap_snapshot.total_allocations snapshot))
       snapshots;
     tbl
 
