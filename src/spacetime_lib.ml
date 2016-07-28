@@ -38,7 +38,7 @@ module Location = struct
   type t =
     { address: Int64.t;
       symbol: string option;
-      position : Position.t option;
+      position : Position.t list;
       foreign : bool; }
 
   let address { address } = address
@@ -63,9 +63,14 @@ module Location = struct
     in
     let position =
       try
-        let slot = Frame_table.find_exn pc frame_table in
-        Printexc.Slot.location slot
-      with Not_found -> None
+        let slots = Frame_table.find_exn pc frame_table in
+        List.fold_right (fun slot acc ->
+            match Printexc.Slot.location slot with
+            | Some location -> location::acc
+            | None -> acc)
+          slots
+          []
+      with Not_found -> []
     in
     { address; symbol; position; foreign; }
 
@@ -73,10 +78,10 @@ module Location = struct
     let program_counter = Program_counter.Foreign.to_int64 pc in
     let position =
       match executable with
-      | None -> None
+      | None -> []
       | Some elf_locations ->
         match Elf_locations.resolve elf_locations ~program_counter with
-        | None -> None
+        | None -> []
         | Some (filename, line_number) ->
           let location =
             { Printexc.
@@ -86,7 +91,7 @@ module Location = struct
               end_char = -1;
             }
           in
-          Some location
+          [location]
     in
     let symbol =
       match executable with
@@ -102,11 +107,13 @@ module Location = struct
 
   let print ppf t =
     match t.position with
-    | Some pos -> Position.print ppf pos
-    | None ->
-        match t.symbol with
-        | Some symbol -> Format.fprintf ppf "%s" symbol
-        | None -> Format.fprintf ppf "%Ld" t.address
+    | [] ->
+      begin match t.symbol with
+      | Some symbol -> Format.fprintf ppf "%s" symbol
+      | None -> Format.fprintf ppf "%Ld" t.address
+      end
+    | locations ->
+      Format.fprintf ppf "%a" (Format.pp_print_list Position.print) locations
 
 end
 

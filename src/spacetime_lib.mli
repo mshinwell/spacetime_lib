@@ -29,7 +29,11 @@ module Location : sig
 
   val address : t -> Int64.t
   val symbol : t -> string option
-  val position : t -> Position.t option
+  (* CR-soon mshinwell: We should think about a better representation for
+     the inlined frames---perhaps trying to flatten them out into [Backtrace.t].
+     However there are some tricky issues (addresses won't be unique keys,
+     the structure of the code in Location.create_{ocaml,foreign} etc). *)
+  val position : t -> Position.t list
   val foreign : t -> bool
 
 end
