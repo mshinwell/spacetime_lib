@@ -82,7 +82,6 @@ module Snapshot : sig
   val stats : t -> Stats.t
   val entries : t -> Entry.t list
 
-  val raw : t -> Raw_spacetime_lib.Heap_snapshot.t
 end
 
 module Series : sig

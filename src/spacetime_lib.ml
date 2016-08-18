@@ -308,7 +308,6 @@ module Snapshot = struct
     { time : float;
       stats : Stats.t;
       entries : Entry.t list;
-      raw : Heap_snapshot.t;
     }
 
   let time { time } = time
@@ -327,9 +326,8 @@ module Snapshot = struct
     let stats =
       { Stats.gc; words_scanned; words_scanned_with_profinfo; }
     in
-    { time; stats; entries; raw = snapshot; }
+    { time; stats; entries; }
 
-  let raw t = t.raw
 end
 
 module Series = struct
