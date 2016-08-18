@@ -334,154 +334,143 @@ module Series = struct
 
   type t = Snapshot.t list
 
-  let rec fold_ocaml_indirect_calls ?executable ~frame_table ~shape_table
-            visited f backtrace acc callee =
+  let iter_opt f = function
+    | None -> ()
+    | Some x -> f x
+
+  let rec iter_ocaml_indirect_calls ?executable ~frame_table ~shape_table
+            visited f backtrace callee =
     let node = Trace.OCaml.Indirect_call_point.Callee.callee_node callee in
-    let acc =
-      fold_node ?executable ~frame_table ~shape_table visited f backtrace
-        acc node
-    in
+    iter_node ?executable ~frame_table ~shape_table visited f backtrace node;
     let next = Trace.OCaml.Indirect_call_point.Callee.next callee in
-    match next with
-    | None -> acc
-    | Some callee ->
-      fold_ocaml_indirect_calls ?executable ~frame_table ~shape_table
-        visited f backtrace acc callee
+    iter_opt
+      (iter_ocaml_indirect_calls ?executable ~frame_table ~shape_table
+         visited f backtrace)
+      next
 
-  and fold_ocaml_fields ?executable ~frame_table ~shape_table
-        visited f backtrace acc field =
-    let acc =
-      match Trace.OCaml.Field.classify field with
-      | Trace.OCaml.Field.Allocation alloc ->
-        let pc = Trace.OCaml.Allocation_point.program_counter alloc in
-        let loc = Location.create_ocaml ?executable ~frame_table pc in
-        let annot = Trace.OCaml.Allocation_point.annotation alloc in
-        f (loc :: backtrace) annot acc
-      | Trace.OCaml.Field.Direct_call (Trace.OCaml.Field.To_ocaml call) ->
-        let site = Trace.OCaml.Direct_call_point.call_site call in
-        let loc = Location.create_ocaml ?executable ~frame_table site in
-        let node = Trace.OCaml.Direct_call_point.callee_node call in
-        fold_ocaml_node ?executable ~frame_table ~shape_table
-          visited f (loc :: backtrace) acc node
-      | Trace.OCaml.Field.Direct_call (Trace.OCaml.Field.To_foreign call) ->
-        let site = Trace.OCaml.Direct_call_point.call_site call in
-        let loc = Location.create_ocaml ?executable ~frame_table site in
-        let node = Trace.OCaml.Direct_call_point.callee_node call in
-        fold_foreign_node ?executable ~frame_table ~shape_table
-          visited f (loc :: backtrace) acc node
-      | Trace.OCaml.Field.Direct_call
-          (Trace.OCaml.Field.To_uninstrumented _) ->
-        acc
-      | Trace.OCaml.Field.Indirect_call call ->
-        let site = Trace.OCaml.Indirect_call_point.call_site call in
-        let loc = Location.create_ocaml ?executable ~frame_table site in
-        let callee = Trace.OCaml.Indirect_call_point.callees call in
-        match callee with
-        | None -> acc
-        | Some callee ->
-          fold_ocaml_indirect_calls ?executable ~frame_table ~shape_table
-            visited f (loc :: backtrace) acc callee
-    in
-    match Trace.OCaml.Field.next field with
-    | None -> acc
-    | Some field ->
-      fold_ocaml_fields ?executable ~frame_table ~shape_table
-        visited f backtrace acc field
+  and iter_ocaml_field_classification ?executable ~frame_table ~shape_table
+        visited f backtrace classification =
+    match classification with
+    | Trace.OCaml.Field.Allocation alloc ->
+      let pc = Trace.OCaml.Allocation_point.program_counter alloc in
+      let loc = Location.create_ocaml ?executable ~frame_table pc in
+      let annot = Trace.OCaml.Allocation_point.annotation alloc in
+      f (loc :: backtrace) annot
+    | Trace.OCaml.Field.Direct_call (Trace.OCaml.Field.To_ocaml call) ->
+      let site = Trace.OCaml.Direct_call_point.call_site call in
+      let loc = Location.create_ocaml ?executable ~frame_table site in
+      let node = Trace.OCaml.Direct_call_point.callee_node call in
+      iter_ocaml_node ?executable ~frame_table ~shape_table
+        visited f (loc :: backtrace) node
+    | Trace.OCaml.Field.Direct_call (Trace.OCaml.Field.To_foreign call) ->
+      let site = Trace.OCaml.Direct_call_point.call_site call in
+      let loc = Location.create_ocaml ?executable ~frame_table site in
+      let node = Trace.OCaml.Direct_call_point.callee_node call in
+      iter_foreign_node ?executable ~frame_table ~shape_table
+        visited f (loc :: backtrace) node
+    | Trace.OCaml.Field.Direct_call
+        (Trace.OCaml.Field.To_uninstrumented _) -> ()
+    | Trace.OCaml.Field.Indirect_call call ->
+      let site = Trace.OCaml.Indirect_call_point.call_site call in
+      let loc = Location.create_ocaml ?executable ~frame_table site in
+      let callee = Trace.OCaml.Indirect_call_point.callees call in
+      iter_opt
+        (iter_ocaml_indirect_calls ?executable ~frame_table ~shape_table
+           visited f (loc :: backtrace))
+        callee
 
-  and fold_ocaml_node ?executable ~frame_table ~shape_table visited f
-        backtrace acc node =
-    if Trace.Node.Set.mem (Trace.Node.of_ocaml_node node) !visited then acc
+  and iter_ocaml_fields ?executable ~frame_table ~shape_table
+        visited f backtrace field =
+    iter_ocaml_field_classification ?executable ~frame_table ~shape_table
+        visited f backtrace (Trace.OCaml.Field.classify field);
+    iter_opt
+      (iter_ocaml_fields ?executable ~frame_table ~shape_table
+        visited f backtrace)
+      (Trace.OCaml.Field.next field)
+
+  and iter_ocaml_node ?executable ~frame_table ~shape_table visited f
+        backtrace node =
+    if Trace.Node.Set.mem (Trace.Node.of_ocaml_node node) !visited then ()
     else begin
       visited := Trace.Node.Set.add (Trace.Node.of_ocaml_node node) !visited;
-      let acc =
-         fold_ocaml_node
-           ?executable ~frame_table ~shape_table visited f backtrace acc
-           (Trace.OCaml.Node.next_in_tail_call_chain node)
-      in
-      let acc =
-        match Trace.OCaml.Node.fields node ~shape_table with
-        | None -> acc
-        | Some fields ->
-          fold_ocaml_fields
-            ?executable ~frame_table ~shape_table visited f backtrace acc fields
-      in
-      acc
+      iter_ocaml_node
+        ?executable ~frame_table ~shape_table visited f backtrace
+        (Trace.OCaml.Node.next_in_tail_call_chain node);
+      iter_opt
+        (iter_ocaml_fields
+          ?executable ~frame_table ~shape_table visited f backtrace)
+        (Trace.OCaml.Node.fields node ~shape_table)
     end
 
-  and fold_foreign_fields ?executable ~frame_table ~shape_table
-        visited f backtrace acc field =
-    let acc =
-      match Trace.Foreign.Field.classify field with
-      | Trace.Foreign.Field.Allocation alloc ->
-        let pc = Trace.Foreign.Allocation_point.program_counter alloc in
-        let loc = Location.create_foreign ?executable pc in
-        let annot = Trace.Foreign.Allocation_point.annotation alloc in
-        f (loc :: backtrace) annot acc
-      | Trace.Foreign.Field.Call call ->
-        let site = Trace.Foreign.Call_point.call_site call in
-        let loc = Location.create_foreign ?executable site in
-        let node = Trace.Foreign.Call_point.callee_node call in
-        fold_node ?executable ~frame_table ~shape_table
-          visited f (loc :: backtrace) acc node
-    in
-    match Trace.Foreign.Field.next field with
-    | None -> acc
-    | Some field ->
-      fold_foreign_fields ?executable ~frame_table ~shape_table
-        visited f backtrace acc field
+  and iter_foreign_field_classification ?executable ~frame_table ~shape_table
+        visited f backtrace classification =
+    match classification with
+    | Trace.Foreign.Field.Allocation alloc ->
+      let pc = Trace.Foreign.Allocation_point.program_counter alloc in
+      let loc = Location.create_foreign ?executable pc in
+      let annot = Trace.Foreign.Allocation_point.annotation alloc in
+      f (loc :: backtrace) annot
+    | Trace.Foreign.Field.Call call ->
+      let site = Trace.Foreign.Call_point.call_site call in
+      let loc = Location.create_foreign ?executable site in
+      let node = Trace.Foreign.Call_point.callee_node call in
+      iter_node ?executable ~frame_table ~shape_table
+        visited f (loc :: backtrace) node
 
-  and fold_foreign_node ?executable ~frame_table ~shape_table visited f
-        backtrace acc node =
-    match Trace.Foreign.Node.fields node with
-    | None -> acc
-    | Some field ->
-      fold_foreign_fields ?executable ~frame_table ~shape_table
-        visited f backtrace acc field
+  and iter_foreign_fields ?executable ~frame_table ~shape_table
+        visited f backtrace field =
+    iter_foreign_field_classification ?executable ~frame_table ~shape_table
+        visited f backtrace (Trace.Foreign.Field.classify field);
+    iter_opt
+      (iter_foreign_fields ?executable ~frame_table ~shape_table
+         visited f backtrace)
+      (Trace.Foreign.Field.next field)
 
-  and fold_node ?executable ~frame_table ~shape_table visited f backtrace
-        acc node =
+  and iter_foreign_node ?executable ~frame_table ~shape_table visited f
+        backtrace node =
+    iter_opt
+      (iter_foreign_fields ?executable ~frame_table ~shape_table
+         visited f backtrace)
+      (Trace.Foreign.Node.fields node)
+
+  and iter_node ?executable ~frame_table ~shape_table visited f backtrace
+        node =
     match Trace.Node.classify node with
     | Trace.Node.OCaml node ->
-      fold_ocaml_node ?executable ~frame_table ~shape_table visited f
-        backtrace acc node
+      iter_ocaml_node ?executable ~frame_table ~shape_table visited f
+        backtrace node
     | Trace.Node.Foreign node ->
-      fold_foreign_node ?executable ~frame_table ~shape_table visited f
-        backtrace acc node
+      iter_foreign_node ?executable ~frame_table ~shape_table visited f
+        backtrace node
 
-  let fold_trace ?executable ~frame_table ~shape_table f acc trace =
+  let iter_trace ?executable ~frame_table ~shape_table f trace =
     match Trace.root trace with
-    | None -> acc
+    | None -> ()
     | Some node ->
       let visited = ref Trace.Node.Set.empty in
-      fold_node ?executable ~frame_table ~shape_table visited f [] acc node
+      iter_node ?executable ~frame_table ~shape_table visited f [] node
 
-  let fold_traces ?executable ~series ~frame_table ~shape_table f acc =
+  let iter_traces ?executable ~series ~frame_table ~shape_table f =
     let num_threads = Heap_snapshot.Series.num_threads series in
-    let rec loop acc n =
-      if n >= num_threads then acc
+    let rec loop n =
+      if n >= num_threads then ()
       else begin
         let normal =
           Heap_snapshot.Series.trace series Heap_snapshot.Series.Normal n
         in
-        let acc =
-          match normal with
-          | None -> acc
-          | Some trace ->
-            fold_trace ?executable ~frame_table ~shape_table f acc trace
-        in
+        iter_opt
+          (iter_trace ?executable ~frame_table ~shape_table f)
+          normal;
         let finaliser =
           Heap_snapshot.Series.trace series Heap_snapshot.Series.Finaliser n
         in
-        let acc =
-          match finaliser with
-          | None -> acc
-          | Some trace ->
-            fold_trace ?executable ~frame_table ~shape_table f acc trace
-        in
-        loop acc (n + 1)
+        iter_opt
+          (iter_trace ?executable ~frame_table ~shape_table f)
+          finaliser;
+        loop (n + 1)
       end
     in
-    loop acc 0
+    loop 0
 
   let data_table ~snapshots =
     let num_snapshots = List.length snapshots in
@@ -572,32 +561,25 @@ module Series = struct
       loop [] (length - 1)
     in
     let data_table = data_table ~snapshots in
-    let init =
-      List.mapi
-        (fun idx snapshot -> idx, snapshot, [])
-        snapshots
+    let num_snapshots = List.length snapshots in
+    let entries = Array.make num_snapshots [] in
+    let accumulate backtrace annot =
+      match Hashtbl.find data_table annot with
+      | exception Not_found -> ()
+      | data ->
+        for i = 0 to num_snapshots - 1 do
+          match data.(i) with
+          | Annotation_data.Nothing -> ()
+          | data ->
+              let entry = Entry.create ~backtrace ~data in
+              entries.(i) <- entry :: entries.(i)
+        done
     in
-    let accumulate backtrace annot accs =
-      List.map
-        (fun ((idx, snapshot, entries) as acc) ->
-           match Hashtbl.find data_table annot with
-           | exception Not_found -> acc
-           | array ->
-             match array.(idx) with
-             | Annotation_data.Nothing -> acc
-             | data ->
-               let entry = Entry.create ~backtrace ~data in
-               let entries = entry :: entries in
-               idx, snapshot, entries)
-        accs
-    in
+    iter_traces ?executable ~series ~frame_table ~shape_table accumulate;
     let snapshots =
-      fold_traces ?executable ~series ~frame_table ~shape_table accumulate init
-    in
-    let snapshots =
-      List.map
-        (fun (_, snapshot, entries) -> Snapshot.create ~snapshot ~entries)
-        snapshots
+      List.map2
+        (fun snapshot entries -> Snapshot.create ~snapshot ~entries)
+        snapshots (Array.to_list entries)
     in
     snapshots
 
