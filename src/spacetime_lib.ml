@@ -153,6 +153,8 @@ module Small_count : sig
 
   val create : allocations:int -> words:int -> blocks:int -> t
 
+  val zeros : t
+
   val allocations : t -> int
 
   val words : t -> int
@@ -184,6 +186,8 @@ end = struct
     lor words lsl words_shift
     lor blocks lsl blocks_shift
 
+  let zeros = 0
+
   let allocations t =
     (t land allocations_mask) lsr allocations_shift
 
@@ -194,45 +198,6 @@ end = struct
     (t land blocks_mask) lsr blocks_shift
 
 end
-
-module Annotation_data = struct
-
-  type t =
-    | Nothing
-    | Alloc of { allocations : int; }
-    | Small of { counts : Small_count.t; }
-    | Large of { blocks : int;
-                 words : int;
-                 allocations : int; }
-
-  let create ~blocks ~words =
-    if words <= 0 && blocks <= 0 then Nothing
-    else if words <= Small_count.max_words
-         && blocks <= Small_count.max_blocks then
-      Small { counts = Small_count.create ~allocations:0 ~words ~blocks }
-    else Large { blocks; words; allocations = 0 }
-
-  let set_allocations t ~allocations =
-    if allocations <= 0 then t
-    else begin
-      match t with
-      | Nothing -> Alloc { allocations }
-      | Alloc _ -> assert false
-      | Small { counts } ->
-        let words = Small_count.words counts in
-        let blocks = Small_count.blocks counts in
-        if allocations <= Small_count.max_allocations then begin
-          let counts = Small_count.create ~allocations ~words ~blocks in
-          Small { counts }
-        end else begin
-          Large { words; blocks; allocations }
-        end
-      | Large { words; blocks; allocations = _ } ->
-        Large { words; blocks; allocations }
-    end
-
-end
-
 
 module Entry = struct
 
@@ -245,16 +210,6 @@ module Entry = struct
                  blocks : int;
                  words : int;
                  allocations : int; }
-
-  let create ~backtrace ~data =
-    match data with
-    | Annotation_data.Nothing -> assert false
-    | Annotation_data.Alloc { allocations } ->
-      Alloc { backtrace; allocations }
-    | Annotation_data.Small { counts } ->
-      Small { backtrace; counts }
-    | Annotation_data.Large { blocks; words; allocations } ->
-      Large { backtrace; blocks; words; allocations }
 
   let backtrace = function
     | Alloc { backtrace } -> backtrace
@@ -275,6 +230,242 @@ module Entry = struct
     | Alloc { allocations } -> allocations
     | Small { counts } -> Small_count.allocations counts
     | Large { allocations } -> allocations
+
+  let set_allocations new_allocations = function
+    | Alloc { backtrace; allocations } as entry ->
+      if allocations = new_allocations then entry
+      else Alloc { backtrace; allocations = new_allocations }
+    | Small { backtrace; counts } as entry ->
+      let allocations = Small_count.allocations counts in
+      if allocations = new_allocations then entry
+      else begin
+        let blocks = Small_count.blocks counts in
+        let words = Small_count.words counts in
+        if allocations <= Small_count.max_allocations then begin
+          let new_counts =
+            Small_count.create ~blocks ~words ~allocations:new_allocations
+          in
+          Small { backtrace; counts = new_counts }
+        end else begin
+          Large { backtrace; blocks; words; allocations }
+        end
+      end
+    | Large { backtrace; blocks; words; allocations } as entry ->
+      if allocations = new_allocations then entry
+      else Large { backtrace; blocks; words; allocations = new_allocations }
+
+end
+
+module Annotation_data = struct
+
+  type updates =
+    | Nil
+    | UpdateAlloc of
+        { index: int;
+          allocations : int;
+          next: updates }
+    | UpdateSmall of
+        { index: int;
+          counts : Small_count.t;
+          next: updates }
+    | UpdateLarge of
+        { index: int;
+          blocks : int;
+          words : int;
+          allocations : int;
+          next: updates }
+
+  type t =
+    { mutable updates: updates;
+      mutable last: int; }
+
+  let create () =
+    { updates = Nil;
+      last = -1; }
+
+  let finish_updates t ~upto =
+    if t.last < upto then begin
+      let rec loop ~last ~prev_blocks ~prev_words = function
+        | Nil ->
+            if prev_blocks = 0 && prev_words = 0 then raise Exit
+            else begin
+              UpdateSmall { index = last + 1; counts = Small_count.zeros;
+                            next = Nil; }
+            end
+        | UpdateAlloc _ -> assert false
+        | UpdateSmall { index; counts; next } ->
+            let blocks = Small_count.blocks counts in
+            let words = Small_count.words counts in
+            let next = loop ~last ~prev_blocks:blocks ~prev_words:words next in
+            UpdateSmall { index; counts; next }
+        | UpdateLarge { index; blocks; words; allocations; next } ->
+            let next = loop ~last ~prev_blocks:blocks ~prev_words:words next in
+            UpdateLarge { index; blocks; words; allocations; next }
+      in
+      let updates =
+        try
+          loop ~last:t.last ~prev_blocks:0 ~prev_words:0 t.updates
+        with Exit -> t.updates
+      in
+      t.updates <- updates;
+      t.last <- upto
+    end
+
+  let set_blocks_and_words t idx ~blocks ~words =
+    let rec loop ~idx ~new_blocks ~new_words
+              ~prev_blocks ~prev_words = function
+      | Nil ->
+        if new_blocks = prev_blocks && new_words = prev_words then begin
+          raise Exit
+        end else begin
+          if new_blocks <= Small_count.max_blocks
+             && new_words <= Small_count.max_words then begin
+            let new_counts =
+              Small_count.create
+                ~blocks:new_blocks ~words:new_words ~allocations:0
+            in
+            UpdateSmall { index = idx; counts = new_counts; next = Nil }
+          end else begin
+            UpdateLarge { index = idx; blocks = new_blocks; words = new_words;
+                          allocations = 0; next = Nil }
+          end
+        end
+      | UpdateAlloc _ -> assert false
+      | UpdateSmall { index; counts; next } ->
+          assert (index < idx);
+          let blocks = Small_count.blocks counts in
+          let words = Small_count.words counts in
+          let next =
+            loop ~idx ~new_blocks ~new_words
+              ~prev_blocks:blocks ~prev_words:words next
+          in
+          UpdateSmall { index; counts; next }
+      | UpdateLarge { index; blocks; words; allocations = _; next } ->
+          assert (index < idx);
+          let next =
+            loop ~idx ~new_blocks ~new_words
+              ~prev_blocks:blocks ~prev_words:words next
+          in
+          UpdateLarge { index; blocks; words; allocations = 0; next }
+    in
+    finish_updates t ~upto:(idx - 1);
+    t.last <- idx;
+    match loop ~idx ~new_blocks:blocks ~new_words:words
+            ~prev_blocks:0 ~prev_words:0 t.updates with
+    | updates -> t.updates <- updates
+    | exception Exit -> ()
+
+  let set_allocations t idx ~num_snapshots ~allocations =
+    let rec loop ~idx ~new_allocations ~prev_allocations = function
+      | Nil ->
+        if new_allocations = prev_allocations then begin
+          raise Exit
+        end else begin
+          UpdateAlloc { index = idx;
+                        allocations = new_allocations; next = Nil }
+        end
+      | UpdateAlloc { index; allocations; next } ->
+        assert (index < idx);
+        let next =
+          loop ~idx ~new_allocations ~prev_allocations:allocations next
+        in
+        UpdateAlloc { index; allocations; next }
+      | UpdateSmall { index; counts; next } as data ->
+        if index = idx then begin
+          let blocks = Small_count.blocks counts in
+          let words = Small_count.words counts in
+          if new_allocations <= Small_count.max_allocations then begin
+            let new_counts =
+              Small_count.create ~blocks ~words ~allocations:new_allocations
+            in
+            UpdateSmall { index = idx; counts = new_counts; next }
+          end else begin
+            UpdateLarge { index = idx; blocks; words;
+                          allocations = new_allocations; next }
+          end
+        end else if index < idx then begin
+          let allocations = Small_count.allocations counts in
+          let next =
+            loop ~idx ~new_allocations ~prev_allocations:allocations next
+          in
+          UpdateSmall { index; counts; next }
+        end else if new_allocations = prev_allocations then begin
+          raise Exit
+        end else begin
+          UpdateAlloc { index = idx;allocations = new_allocations;
+                        next = data }
+        end
+      | UpdateLarge { index; blocks; words; allocations; next } as data ->
+        if index = idx then begin
+          UpdateLarge { index = idx; blocks; words;
+                        allocations = new_allocations; next }
+        end else if index < idx then begin
+          let next =
+            loop ~idx ~new_allocations ~prev_allocations:allocations next
+          in
+          UpdateLarge { index; blocks; words; allocations; next }
+        end else if new_allocations = prev_allocations then begin
+          raise Exit
+        end else begin
+          UpdateAlloc { index = idx; allocations = new_allocations;
+                        next = data }
+        end
+    in
+    finish_updates t ~upto:(num_snapshots - 1);
+    match loop ~idx ~new_allocations:allocations
+            ~prev_allocations:0 t.updates with
+    | updates -> t.updates <- updates
+    | exception Exit -> ()
+
+  let store_entries ~backtrace ~data ~entries =
+    let rec loop ~entries ~idx ~prev_entry data =
+      if idx >= Array.length entries then ()
+      else begin
+        match data with
+        | Nil ->
+          entries.(idx) <- prev_entry :: entries.(idx);
+          loop ~entries ~idx:(idx + 1) ~prev_entry data
+        | UpdateAlloc { index; allocations; next } ->
+          if index <= idx then begin
+            let entry = Entry.set_allocations allocations prev_entry in
+            loop ~entries ~idx ~prev_entry:entry next
+          end else begin
+            entries.(idx) <- prev_entry :: entries.(idx);
+            loop ~entries ~idx:(idx + 1) ~prev_entry data
+          end
+        | UpdateSmall { index; counts; next } ->
+          if index <= idx then begin
+            let backtrace = Entry.backtrace prev_entry in
+            let entry = Entry.Small { backtrace; counts } in
+            loop ~entries ~idx ~prev_entry:entry next
+          end else begin
+            entries.(idx) <- prev_entry :: entries.(idx);
+            loop ~entries ~idx:(idx + 1) ~prev_entry data
+          end
+        | UpdateLarge { index; blocks; words; allocations; next } ->
+          if index <= idx then begin
+            let backtrace = Entry.backtrace prev_entry in
+            let entry =
+              Entry.Large { backtrace; blocks; words; allocations }
+            in
+            loop ~entries ~idx ~prev_entry:entry next
+          end else begin
+            entries.(idx) <- prev_entry :: entries.(idx);
+            loop ~entries ~idx:(idx + 1) ~prev_entry data
+          end
+      end
+    in
+    match data.updates with
+    | Nil -> ()
+    | UpdateAlloc { index; allocations; next } ->
+      let entry = Entry.Alloc { backtrace; allocations } in
+      loop ~entries ~idx:index ~prev_entry:entry next
+    | UpdateSmall { index; counts; next } ->
+      let entry = Entry.Small { backtrace; counts } in
+      loop ~entries ~idx:index ~prev_entry:entry next
+    | UpdateLarge { index; blocks; words; allocations; next } ->
+      let entry = Entry.Large { backtrace; blocks; words; allocations } in
+      loop ~entries ~idx:index ~prev_entry:entry next
 
 end
 
@@ -472,8 +663,7 @@ module Series = struct
     in
     loop 0
 
-  let data_table ~snapshots =
-    let num_snapshots = List.length snapshots in
+  let data_table ~num_snapshots ~snapshots =
     let tbl = Hashtbl.create 42 in
     List.iteri
       (fun idx snapshot ->
@@ -484,23 +674,18 @@ module Series = struct
            let words =
              Heap_snapshot.Entries.num_words_including_headers entries entry
            in
-           if blocks > 0 || words > 0 then begin
-             let annotation =
-               Heap_snapshot.Entries.annotation entries entry
-             in
-             let array =
-               match Hashtbl.find tbl annotation with
-               | array -> array
-               | exception Not_found ->
-                 let array =
-                   Array.make num_snapshots Annotation_data.Nothing
-                 in
-                 Hashtbl.add tbl annotation array;
-                 array
-             in
-             let data = Annotation_data.create ~words ~blocks in
-             array.(idx) <- data
-           end
+           let annotation =
+             Heap_snapshot.Entries.annotation entries entry
+           in
+           let data =
+             match Hashtbl.find tbl annotation with
+             | data -> data
+             | exception Not_found ->
+               let data = Annotation_data.create () in
+               Hashtbl.add tbl annotation data;
+               data
+           in
+           Annotation_data.set_blocks_and_words data idx ~blocks ~words
          done)
       snapshots;
     List.iteri
@@ -513,25 +698,19 @@ module Series = struct
                Heap_snapshot.Total_allocation.num_words_including_headers
                  allocation
              in
-             if allocations > 0 then begin
-               let annotation =
-                 Heap_snapshot.Total_allocation.annotation allocation
-               in
-               let array =
-                 match Hashtbl.find tbl annotation with
-                 | array -> array
-                 | exception Not_found ->
-                   let array =
-                     Array.make num_snapshots Annotation_data.Nothing
-                   in
-                   Hashtbl.add tbl annotation array;
-                   array
-               in
-               let data =
-                 Annotation_data.set_allocations array.(idx) ~allocations
-               in
-               array.(idx) <- data
-             end;
+             let annotation =
+               Heap_snapshot.Total_allocation.annotation allocation
+             in
+             let data =
+               match Hashtbl.find tbl annotation with
+               | data -> data
+               | exception Not_found ->
+                 let data = Annotation_data.create () in
+                 Hashtbl.add tbl annotation data;
+                 data
+             in
+             Annotation_data.set_allocations
+               data idx ~num_snapshots ~allocations;
              let next = Heap_snapshot.Total_allocation.next allocation in
              loop next
          in
@@ -552,7 +731,7 @@ module Series = struct
     let length = Heap_snapshot.Series.num_snapshots series in
     let snapshots =
       let rec loop acc n =
-        if n < 0 then List.rev acc
+        if n < 0 then acc
         else begin
           let snapshot = Heap_snapshot.Series.snapshot series ~index:n in
           loop (snapshot :: acc) (n - 1)
@@ -560,20 +739,14 @@ module Series = struct
       in
       loop [] (length - 1)
     in
-    let data_table = data_table ~snapshots in
     let num_snapshots = List.length snapshots in
+    let data_table = data_table ~num_snapshots ~snapshots in
     let entries = Array.make num_snapshots [] in
     let accumulate backtrace annot =
       match Hashtbl.find data_table annot with
       | exception Not_found -> ()
       | data ->
-        for i = 0 to num_snapshots - 1 do
-          match data.(i) with
-          | Annotation_data.Nothing -> ()
-          | data ->
-              let entry = Entry.create ~backtrace ~data in
-              entries.(i) <- entry :: entries.(i)
-        done
+        Annotation_data.store_entries ~backtrace ~data ~entries
     in
     iter_traces ?executable ~series ~frame_table ~shape_table accumulate;
     let snapshots =
