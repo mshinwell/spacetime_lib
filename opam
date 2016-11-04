@@ -1,12 +1,12 @@
 opam-version: "1.2"
 name: "spacetime_lib"
 version: "0.1"
-maintainer: "Leo White <lwhite@janestreet.com>"
-authors: ["Leo White <lwhite@janestreet.com>" "Mark Shinwell <mshinwell@janestreet.com>"]
-homepage: "https://github.com/janestreet/spacetime_lib"
-bug-reports: "https://github.com/janestreet/spacetime_lib"
+maintainer: "Leo White <leo@lpw25.net>"
+authors: ["Leo White <leo@lpw25.net>" "Mark Shinwell <mshinwell@janestreet.com>"]
+homepage: "https://github.com/lpw25/spacetime_lib"
+bug-reports: "https://github.com/lpw25/spacetime_lib"
 license: "MIT"
-dev-repo: "https://github.com/janestreet/spacetime_lib"
+dev-repo: "https://github.com/lpw25/spacetime_lib"
 build: [
   [make]
 ]
