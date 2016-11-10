@@ -11,7 +11,7 @@ RESULT=spacetime_lib
 
 SOURCES=elf_locations.mli elf_locations.ml spacetime_lib.mli spacetime_lib.ml
 
-PACKS=owee base-raw_spacetime_lib
+PACKS=owee raw_spacetime
 
 all: native-code-library
 
