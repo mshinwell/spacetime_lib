@@ -15,7 +15,7 @@ remove: ["ocamlfind" "remove" "spacetime_lib"]
 depends: [
   "ocamlfind" {build}
   "owee"
-  "base-raw_spacetime_lib"
+  "raw_spacetime"
   "base-bigarray"
   "base-unix"
 ]
