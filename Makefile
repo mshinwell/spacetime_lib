@@ -5,7 +5,6 @@ spacetime_lib:
 
 clean:
 	$(MAKE) -C src $@
-	$(MAKE) -C examples $@
 
 .PHONY: all spacetime_lib clean install uninstall reinstall
 
@@ -28,6 +27,3 @@ uninstall:
 reinstall:
 	-$(MAKE) uninstall
 	$(MAKE) install
-
-examples:
-	$(MAKE) -C examples
