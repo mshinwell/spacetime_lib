@@ -4,7 +4,7 @@
 (*                                                                        *)
 (*           Mark Shinwell and Leo White, Jane Street Europe              *)
 (*                                                                        *)
-(*   Copyright 2015--2016 Jane Street Group LLC                           *)
+(*   Copyright 2015--2017 Jane Street Group LLC                           *)
 (*                                                                        *)
 (*   All rights reserved.  This file is distributed under the terms of    *)
 (*   the GNU Lesser General Public License version 2.1, with the          *)
@@ -118,27 +118,30 @@ module Location = struct
 end
 
 module Backtrace = struct
+  module T = struct
+    type t = Location.t list
 
-  type t = Location.t list
+    let rec compare b1 b2 =
+      match b1, b2 with
+      | [], [] -> 0
+      | l1 :: b1, l2 :: b2 ->
+        let c = Location.compare l1 l2 in
+        if c <> 0 then c
+        else compare b1 b2
+      | _ :: _, [] -> 1
+      | [], _ :: _ -> -1
 
-  let rec compare b1 b2 =
-    match b1, b2 with
-    | [], [] -> 0
-    | l1 :: b1, l2 :: b2 ->
-      let c = Location.compare l1 l2 in
-      if c <> 0 then c
-      else compare b1 b2
-    | _ :: _, [] -> 1
-    | [], _ :: _ -> -1
+    let rec print ppf = function
+      | [] -> ()
+      | [loc] -> Location.print ppf loc
+      | loc :: res ->
+        Format.fprintf ppf "%a %a"
+          Location.print loc
+          print res
+  end
 
-  let rec print ppf = function
-    | [] -> ()
-    | [loc] -> Location.print ppf loc
-    | loc :: res ->
-      Format.fprintf ppf "%a %a"
-        Location.print loc
-        print res
-
+  include T
+  module Map = Map.Make (T)
 end
 
 module Small_count : sig
@@ -210,26 +213,48 @@ module Entry = struct
                  blocks : int;
                  words : int;
                  allocations : int; }
+    | Direct_call of { backtrace : Backtrace.t;
+                       count : int; }
+    | Indirect_call of { backtrace : Backtrace.t;
+                         count : int; }
 
   let backtrace = function
     | Alloc { backtrace } -> backtrace
     | Small { backtrace } -> backtrace
     | Large { backtrace } -> backtrace
+    | Indirect_call { backtrace; _ } -> backtrace
+    | Direct_call { backtrace; _ } -> backtrace
 
   let blocks = function
     | Alloc _ -> 0
     | Small { counts } -> Small_count.blocks counts
     | Large { blocks } -> blocks
+    | Indirect_call _ -> 0
+    | Direct_call _ -> 0
 
   let words = function
     | Alloc _ -> 0
     | Small { counts } -> Small_count.words counts
     | Large { words } -> words
+    | Indirect_call _ -> 0
+    | Direct_call _ -> 0
 
   let allocations = function
     | Alloc { allocations } -> allocations
     | Small { counts } -> Small_count.allocations counts
     | Large { allocations } -> allocations
+    | Indirect_call _ -> 0
+    | Direct_call _ -> 0
+
+  let indirect_calls = function
+    | Alloc _ | Small _ | Large _ -> 0
+    | Indirect_call { count; _ } -> count
+    | Direct_call _ -> 0
+
+  let direct_calls = function
+    | Alloc _ | Small _ | Large _ -> 0
+    | Indirect_call _ -> 0
+    | Direct_call { count; _ } -> count
 
   let set_allocations new_allocations = function
     | Alloc { backtrace; allocations } as entry ->
@@ -253,6 +278,8 @@ module Entry = struct
     | Large { backtrace; blocks; words; allocations } as entry ->
       if allocations = new_allocations then entry
       else Large { backtrace; blocks; words; allocations = new_allocations }
+    | (Indirect_call _ as entry) -> entry
+    | (Direct_call _ as entry) -> entry
 
 end
 
@@ -497,7 +524,7 @@ module Snapshot = struct
 
   type t =
     { time : float;
-      stats : Stats.t;
+      stats : Stats.t option;
       entries : Entry.t list;
     }
 
@@ -508,14 +535,20 @@ module Snapshot = struct
   let entries { entries } = entries
 
   let create ~snapshot ~entries =
-    let time = Heap_snapshot.timestamp snapshot in
-    let gc = Heap_snapshot.gc_stats snapshot in
-    let words_scanned = Heap_snapshot.words_scanned snapshot in
-    let words_scanned_with_profinfo =
-      Heap_snapshot.words_scanned_with_profinfo snapshot
-    in
-    let stats =
-      { Stats.gc; words_scanned; words_scanned_with_profinfo; }
+    let time, stats =
+      match snapshot with
+      | None -> 0.0, None
+      | Some snapshot ->
+        let time = Heap_snapshot.timestamp snapshot in
+        let gc = Heap_snapshot.gc_stats snapshot in
+        let words_scanned = Heap_snapshot.words_scanned snapshot in
+        let words_scanned_with_profinfo =
+          Heap_snapshot.words_scanned_with_profinfo snapshot
+        in
+        let stats =
+          { Stats.gc; words_scanned; words_scanned_with_profinfo; }
+        in
+        time, Some stats
     in
     { time; stats; entries; }
 
@@ -525,21 +558,55 @@ module Series = struct
 
   type t = Snapshot.t list
 
+  type call_type = Direct | Indirect
+
+  type iterator =
+    | Allocations of (Location.t list -> Annotation.t -> unit)
+    | Calls of (call_type -> int -> Location.t list -> unit)
+
   let iter_opt f opt k =
     match opt with
     | None -> k ()
     | Some x -> f x k
 
-  let rec iter_ocaml_indirect_calls ?executable ~frame_table ~shape_table
-            visited f backtrace callee k =
+  let is_caml_apply ~executable ~program_counter =
+    begin match executable with
+    | None -> false
+    | Some elf_locations ->
+      match Elf_locations.function_at_pc elf_locations ~program_counter with
+      | None -> false
+      | Some symbol ->
+        let check prefix =
+          let prefix_len = String.length prefix in
+          String.length symbol > prefix_len
+            && String.sub symbol 0 prefix_len = prefix
+        in
+        check "caml_apply" || check "caml_fast_apply"
+    end
+
+  let rec iter_ocaml_indirect_calls ?executable ~frame_table ~shape_table ~site
+            visited f loc backtrace callee k =
     let node = Trace.OCaml.Indirect_call_point.Callee.callee_node callee in
-    iter_node
-      ?executable ~frame_table ~shape_table visited f backtrace node (fun () ->
-    let next = Trace.OCaml.Indirect_call_point.Callee.next callee in
-    iter_opt
-      (iter_ocaml_indirect_calls ?executable ~frame_table ~shape_table
-         visited f backtrace)
-      next k)
+    begin match f with
+    | Allocations _ -> ()
+    | Calls f ->
+      let program_counter = Program_counter.OCaml.to_int64 site in
+      match Trace.OCaml.Indirect_call_point.Callee.call_count callee with
+      | None -> ()
+      | Some count ->
+        if is_caml_apply ~executable ~program_counter then begin
+          f Indirect count backtrace
+        end else begin
+          f Indirect count (loc :: backtrace)
+        end
+    end;
+    iter_node ?executable ~frame_table ~shape_table visited f
+      (loc :: backtrace) node (fun () ->
+        let next = Trace.OCaml.Indirect_call_point.Callee.next callee in
+        iter_opt
+          (iter_ocaml_indirect_calls ?executable ~frame_table ~shape_table
+            ~site visited f loc backtrace)
+          next k)
 
   and iter_ocaml_field_classification ?executable ~frame_table ~shape_table
         visited f backtrace classification k =
@@ -548,20 +615,48 @@ module Series = struct
       let pc = Trace.OCaml.Allocation_point.program_counter alloc in
       let loc = Location.create_ocaml ?executable ~frame_table pc in
       let annot = Trace.OCaml.Allocation_point.annotation alloc in
-      f (loc :: backtrace) annot;
+      begin match f with
+      | Allocations f -> f (loc :: backtrace) annot
+      | Calls _ -> ()
+      end;
       k ()
     | Trace.OCaml.Field.Direct_call (Trace.OCaml.Field.To_ocaml call) ->
       let site = Trace.OCaml.Direct_call_point.call_site call in
       let loc = Location.create_ocaml ?executable ~frame_table site in
+      let backtrace = loc :: backtrace in
       let node = Trace.OCaml.Direct_call_point.callee_node call in
+      begin match f with
+      | Allocations _ -> ()
+      | Calls f ->
+        let callee = Trace.OCaml.Direct_call_point.callee call in
+        let count = Trace.OCaml.Direct_call_point.call_count call in
+        let program_counter = Function_entry_point.to_int64 callee in
+        match count with
+        | None -> ()
+        | Some count ->
+          if is_caml_apply ~executable ~program_counter then begin
+            f Indirect count backtrace
+          end else begin
+            f Direct count (loc :: backtrace)
+          end
+      end;
       iter_ocaml_node ?executable ~frame_table ~shape_table
-        visited f (loc :: backtrace) node k
+        visited f backtrace node k
     | Trace.OCaml.Field.Direct_call (Trace.OCaml.Field.To_foreign call) ->
       let site = Trace.OCaml.Direct_call_point.call_site call in
       let loc = Location.create_ocaml ?executable ~frame_table site in
       let node = Trace.OCaml.Direct_call_point.callee_node call in
+      let backtrace = loc :: backtrace in
+      begin match f with
+      | Allocations _ -> ()
+      | Calls f ->
+        let count = Trace.OCaml.Direct_call_point.call_count call in
+        match count with
+        | None -> ()
+        | Some count -> f Direct count backtrace
+      end;
       iter_foreign_node ?executable ~frame_table ~shape_table
-        visited f (loc :: backtrace) node k
+        visited f backtrace node k
     | Trace.OCaml.Field.Direct_call
         (Trace.OCaml.Field.To_uninstrumented _) -> k ()
     | Trace.OCaml.Field.Indirect_call call ->
@@ -569,8 +664,8 @@ module Series = struct
       let loc = Location.create_ocaml ?executable ~frame_table site in
       let callee = Trace.OCaml.Indirect_call_point.callees call in
       iter_opt
-        (iter_ocaml_indirect_calls ?executable ~frame_table ~shape_table
-           visited f (loc :: backtrace))
+        (iter_ocaml_indirect_calls ?executable ~frame_table ~shape_table ~site
+           visited f loc backtrace)
         callee k
 
   and iter_ocaml_fields ?executable ~frame_table ~shape_table
@@ -603,7 +698,10 @@ module Series = struct
       let pc = Trace.Foreign.Allocation_point.program_counter alloc in
       let loc = Location.create_foreign ?executable pc in
       let annot = Trace.Foreign.Allocation_point.annotation alloc in
-      f (loc :: backtrace) annot;
+      begin match f with
+      | Allocations f -> f (loc :: backtrace) annot
+      | Calls _ -> ()
+      end;
       k ()
     | Trace.Foreign.Field.Call call ->
       let site = Trace.Foreign.Call_point.call_site call in
@@ -722,7 +820,9 @@ module Series = struct
       snapshots;
     tbl
 
-  let create ?executable path =
+  type mode = For_allocations | For_calls
+
+  let create ?executable mode path =
     let series = Heap_snapshot.Series.read ~path in
     let executable =
       match executable with
@@ -733,31 +833,74 @@ module Series = struct
     let frame_table = Heap_snapshot.Series.frame_table series in
     let shape_table = Heap_snapshot.Series.shape_table series in
     let length = Heap_snapshot.Series.num_snapshots series in
-    let snapshots =
-      let rec loop acc n =
-        if n < 0 then acc
-        else begin
-          let snapshot = Heap_snapshot.Series.snapshot series ~index:n in
-          loop (snapshot :: acc) (n - 1)
-        end
+    match mode with
+    | For_allocations ->
+      let snapshots =
+        let rec loop acc n =
+          if n < 0 then acc
+          else begin
+            let snapshot = Heap_snapshot.Series.snapshot series ~index:n in
+            loop (snapshot :: acc) (n - 1)
+          end
+        in
+        loop [] (length - 1)
       in
-      loop [] (length - 1)
-    in
-    let num_snapshots = List.length snapshots in
-    let data_table = data_table ~num_snapshots ~snapshots in
-    let entries = Array.make num_snapshots [] in
-    let accumulate backtrace annot =
-      match Hashtbl.find data_table annot with
-      | exception Not_found -> ()
-      | data ->
-        Annotation_data.store_entries ~backtrace ~data ~entries
-    in
-    iter_traces ?executable ~series ~frame_table ~shape_table accumulate;
-    let snapshots =
-      List.map2
-        (fun snapshot entries -> Snapshot.create ~snapshot ~entries)
-        snapshots (Array.to_list entries)
-    in
-    snapshots
-
+      let num_snapshots = List.length snapshots in
+      let data_table = data_table ~num_snapshots ~snapshots in
+      let entries = Array.make num_snapshots [] in
+      let accumulate backtrace annot =
+        match Hashtbl.find data_table annot with
+        | exception Not_found -> ()
+        | data ->
+          Annotation_data.store_entries ~backtrace ~data ~entries
+      in
+      iter_traces ?executable ~series ~frame_table ~shape_table
+        (Allocations accumulate);
+      let snapshots =
+        List.map2 (fun snapshot entries ->
+            Snapshot.create ~snapshot:(Some snapshot) ~entries)
+          snapshots (Array.to_list entries)
+      in
+      snapshots
+    | For_calls ->
+      if not (Heap_snapshot.Series.has_call_counts series) then begin
+        failwith "Spacetime profiling file does not contain call count info"
+      end;
+      let backtraces = ref Backtrace.Map.empty in
+      let accumulate call_type count backtrace =
+        let new_backtraces =
+          match Backtrace.Map.find backtrace !backtraces with
+          | exception Not_found ->
+            begin match call_type with
+            | Direct ->
+              Backtrace.Map.add backtrace (count, 0) !backtraces
+            | Indirect ->
+              Backtrace.Map.add backtrace (0, count) !backtraces
+            end
+          | (direct, indirect) ->
+            begin match call_type with
+            | Direct ->
+              Backtrace.Map.add backtrace (direct + count, indirect) !backtraces
+            | Indirect ->
+              Backtrace.Map.add backtrace (direct, indirect + count) !backtraces
+            end
+        in
+        backtraces := new_backtraces
+      in
+      iter_traces ?executable ~series ~frame_table ~shape_table
+        (Calls accumulate);
+      let entries =
+        Backtrace.Map.fold (fun backtrace (direct, indirect) entries ->
+            let entries =
+              if direct < 1 then entries
+              else (Entry.Direct_call { backtrace; count = direct; }) :: entries
+            in
+            if indirect < 1 then entries
+            else
+              (Entry.Indirect_call { backtrace; count = indirect; }) :: entries)
+          !backtraces
+          []
+      in
+      let snapshot = Snapshot.create ~snapshot:None ~entries in
+      [snapshot]
 end

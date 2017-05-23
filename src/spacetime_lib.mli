@@ -4,7 +4,7 @@
 (*                                                                        *)
 (*           Mark Shinwell and Leo White, Jane Street Europe              *)
 (*                                                                        *)
-(*   Copyright 2015--2016 Jane Street Group LLC                           *)
+(*   Copyright 2015--2017 Jane Street Group LLC                           *)
 (*                                                                        *)
 (*   All rights reserved.  This file is distributed under the terms of    *)
 (*   the GNU Lesser General Public License version 2.1, with the          *)
@@ -42,6 +42,8 @@ module Backtrace : sig
 
   type t = Location.t list
 
+  module Map : Map.S with type key = t
+
 end
 
 module Entry : sig
@@ -52,6 +54,8 @@ module Entry : sig
   val blocks : t -> int
   val words : t -> int
   val allocations : t -> int
+  val direct_calls : t -> int
+  val indirect_calls : t -> int
 
 end
 
@@ -79,7 +83,7 @@ module Snapshot : sig
   type t
 
   val time : t -> float
-  val stats : t -> Stats.t
+  val stats : t -> Stats.t option
   val entries : t -> Entry.t list
 
 end
@@ -88,6 +92,8 @@ module Series : sig
 
   type t = Snapshot.t list
 
-  val create : ?executable:string -> string -> t
+  type mode = For_allocations | For_calls
+
+  val create : ?executable:string -> mode -> string -> t
 
 end
