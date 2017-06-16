@@ -623,7 +623,6 @@ module Series = struct
     | Trace.OCaml.Field.Direct_call (Trace.OCaml.Field.To_ocaml call) ->
       let site = Trace.OCaml.Direct_call_point.call_site call in
       let loc = Location.create_ocaml ?executable ~frame_table site in
-      let backtrace = loc :: backtrace in
       let node = Trace.OCaml.Direct_call_point.callee_node call in
       begin match f with
       | Allocations _ -> ()
@@ -641,7 +640,7 @@ module Series = struct
           end
       end;
       iter_ocaml_node ?executable ~frame_table ~shape_table
-        visited f backtrace node k
+        visited f (loc :: backtrace) node k
     | Trace.OCaml.Field.Direct_call (Trace.OCaml.Field.To_foreign call) ->
       let site = Trace.OCaml.Direct_call_point.call_site call in
       let loc = Location.create_ocaml ?executable ~frame_table site in
